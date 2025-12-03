@@ -6,7 +6,7 @@ import streamlit as st
 import requests
 from databricks import sql
 from io import BytesIO
-from datetime import datetime # <-- ADDED IMPORT
+from datetime import datetime
 
 # ---------- Config ----------
 def get_secret(name: str) -> str:
@@ -22,6 +22,12 @@ MODEL_NAME = "llama-3.3-70b-versatile"
 SCHEMA_JSON_DIR = "schemas"
 os.makedirs(SCHEMA_JSON_DIR, exist_ok=True)
 
+# --- ⚠️ EDIT THIS VALUE ---
+# You MUST still set the report focus
+HARDCODED_REPORT_FOCUS = "Sales Pacing Report" # e.g., "Weekly Sales Trends"
+# --- END OF VALUES TO EDIT ---
+
+
 # ---------- Low-level query helper (cursor usage) ----------
 def run_query_raw(query: str, use_catalog: str = None, use_schema: str = None, timeout: int = 120):
     """Execute query and return (rows, cols). Uses cursor.execute on databricks-sql connector."""
@@ -32,21 +38,15 @@ def run_query_raw(query: str, use_catalog: str = None, use_schema: str = None, t
     ) as conn:
         with conn.cursor() as cur:
             if use_catalog:
-                try:
-                    cur.execute(f"USE CATALOG {use_catalog}")
-                except Exception:
-                    pass
+                try: cur.execute(f"USE CATALOG {use_catalog}")
+                except Exception: pass
             if use_schema:
-                try:
-                    cur.execute(f"USE SCHEMA {use_catalog}.{use_schema}" if use_catalog else f"USE SCHEMA {use_schema}")
+                try: cur.execute(f"USE SCHEMA {use_catalog}.{use_schema}" if use_catalog else f"USE SCHEMA {use_schema}")
                 except Exception:
                     try:
-                        if use_catalog:
-                            cur.execute(f"USE {use_catalog}.{use_schema}")
-                        else:
-                            cur.execute(f"USE {use_schema}")
-                    except Exception:
-                        pass
+                        if use_catalog: cur.execute(f"USE {use_catalog}.{use_schema}")
+                        else: cur.execute(f"USE {use_schema}")
+                    except Exception: pass
             cur.execute(query)
             rows = cur.fetchall()
             cols = [d[0] for d in cur.description] if cur.description else []
@@ -59,20 +59,17 @@ def fetch_current_catalog():
         rows, cols = run_query_raw("SELECT current_catalog()")
         if rows and rows[0] and rows[0][0]:
             return str(rows[0][0])
-    except Exception:
-        pass
+    except Exception: pass
     try:
         rows, cols = run_query_raw("SELECT current_schema()")
         if rows and rows[0] and rows[0][0]:
             return str(rows[0][0])
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
 # ---------- Cached listing helpers ----------
 @st.cache_data(ttl=300)
 def cached_list_databases(workspace: str):
-    """Return DataFrame of databases (schemas) inside the workspace/catalog."""
     try:
         rows, cols = run_query_raw(f"SHOW SCHEMAS IN CATALOG {workspace}", use_catalog=workspace)
     except Exception:
@@ -81,7 +78,6 @@ def cached_list_databases(workspace: str):
 
 @st.cache_data(ttl=300)
 def cached_list_table_names(workspace: str, database: str):
-    """Return a DataFrame with a single column 'table_name' holding table names (fast)."""
     try:
         rows, cols = run_query_raw(f"SHOW TABLES IN {workspace}.{database}", use_catalog=workspace, use_schema=database)
     except Exception:
@@ -95,7 +91,6 @@ def cached_list_table_names(workspace: str, database: str):
 
 @st.cache_data(ttl=600)
 def cached_describe_table(workspace: str, database: str, table: str):
-    """DESCRIBE a single table and cache result per (workspace, database, table)."""
     try:
         rows, cols = run_query_raw(f"DESCRIBE TABLE {workspace}.{database}.{table}", use_catalog=workspace, use_schema=database)
     except Exception:
@@ -103,34 +98,21 @@ def cached_describe_table(workspace: str, database: str, table: str):
     return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
 
 # ---------- Utilities ----------
-def save_schema_json(name: str, payload: dict) -> str:
-    path = os.path.join(SCHEMA_JSON_DIR, f"{name}_schema.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-    return path
-
-# --- MODIFIED HELPER FUNCTION ---
 def sample_table_rows(
     workspace: str, 
     database: str, 
     table: str, 
-    limit: int = 5000, 
+    limit: int = 500000, 
     date_col: str = None, 
     start_dt: datetime.date = None, 
     end_dt: datetime.date = None
 ) -> pd.DataFrame:
-    """
-    Samples table rows, with optional date filtering.
-    NOTE: Assumes date_col is a type compatible with date/timestamp >= '<YYYY-MM-DD>'
-    """
     where_clauses = []
     if date_col and (start_dt or end_dt):
         try:
             if start_dt:
-                # Format date as string for SQL
                 where_clauses.append(f"{date_col} >= '{start_dt.strftime('%Y-%m-%d')}'")
             if end_dt:
-                # Use <= for inclusive end date
                 where_clauses.append(f"{date_col} <= '{end_dt.strftime('%Y-%m-%d')}'")
         except Exception as e:
             st.warning(f"Could not apply date filter (is column name correct?): {e}")
@@ -139,15 +121,12 @@ def sample_table_rows(
     if where_clauses:
         where_sql = " WHERE " + " AND ".join(where_clauses)
         
-    # Construct the final query
     q = f"SELECT * FROM {workspace}.{database}.{table}{where_sql} LIMIT {limit}"
     
     rows, cols = run_query_raw(q, use_catalog=workspace, use_schema=database)
     return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
-# --- END MODIFIED HELPER FUNCTION ---
 
 def describe_to_column_meta(describe_df: pd.DataFrame):
-    """Normalize DESCRIBE output to a list of {name,type,comment}."""
     if describe_df.empty:
         return []
     name_col = next((c for c in describe_df.columns if c.lower() in ("col_name", "column", "name")), None)
@@ -163,12 +142,56 @@ def describe_to_column_meta(describe_df: pd.DataFrame):
     return cols
 
 def to_excel(df: pd.DataFrame) -> bytes:
-    """Converts a DataFrame to an in-memory Excel file."""
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Sheet1')
     processed_data = output.getvalue()
     return processed_data
+
+def get_llm_date_column(cols_meta: list) -> str:
+    """
+    Calls the LLM to identify the most likely primary date column from a schema.
+    """
+    if not cols_meta:
+        return None
+
+    schema_block = json.dumps({"columns": cols_meta}, indent=2)
+    
+    prompt = (
+        f"Given the following table schema:\n{schema_block}\n\n"
+        "Which column *best* represents the primary date or timestamp for business analysis (e.g., transaction_date, order_date, event_date)? "
+        "Return *only* the single, exact column name and nothing else. If no clear date column exists, return 'None'."
+    )
+    
+    system = "You are a schema-parsing assistant. You return only a single column name or the word 'None'."
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": MODEL_NAME,
+        "temperature": 0.0,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+    }
+    
+    try:
+        resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        col_name = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        
+        col_name = col_name.replace('"', '').replace("`", "").replace(".", "")
+        
+        if col_name.lower() == 'none' or col_name == "":
+            return None
+        
+        all_col_names = [c['name'] for c in cols_meta]
+        if col_name in all_col_names:
+            return col_name
+        else:
+            st.warning(f"LLM suggested date column '{col_name}' which was not found in the schema.")
+            return None
+            
+    except Exception as e:
+        st.error(f"Failed to ask LLM for date column: {e}")
+        return None
 
 
 # ---------- UI and behavior ----------
@@ -197,23 +220,45 @@ if "selected_database" not in st.session_state:
     st.session_state.selected_database = None
 if "selected_table" not in st.session_state:
     st.session_state.selected_table = None
-if "report_focus" not in st.session_state:
-    st.session_state.report_focus = "Pacing Report"
 if "last_report" not in st.session_state:
     st.session_state.last_report = ""
 if "last_report_df" not in st.session_state:
     st.session_state.last_report_df = pd.DataFrame()
-# --- ADDED SESSION STATE FOR DATE FILTERS ---
-if "date_column_name" not in st.session_state:
-    st.session_state.date_column_name = ""
 if "start_date_filter" not in st.session_state:
     st.session_state.start_date_filter = None
 if "end_date_filter" not in st.session_state:
     st.session_state.end_date_filter = None
-# --- END ADDED SESSION STATE ---
+# --- ADDED SESSION STATE FOR DATE COLUMN ---
+if "date_column_name" not in st.session_state:
+    st.session_state.date_column_name = ""
 
 
 st.sidebar.header("Controls")
+
+# --- NEW: Function to auto-detect date column when table changes ---
+def on_table_change():
+    ws = st.session_state.workspace
+    db = st.session_state.selected_database
+    tbl = st.session_state.selected_table
+    
+    if not (ws and db and tbl):
+        st.session_state.date_column_name = ""
+        return
+
+    try:
+        # Get schema and ask LLM for date col
+        describe_df = cached_describe_table(ws, db, tbl)
+        cols_meta = describe_to_column_meta(describe_df)
+        if cols_meta:
+            with st.spinner("AI is guessing the date column..."):
+                ai_guessed_col = get_llm_date_column(cols_meta)
+                st.session_state.date_column_name = ai_guessed_col or ""
+        else:
+            st.session_state.date_column_name = ""
+    except Exception as e:
+        st.warning(f"Could not auto-detect date column: {e}")
+        st.session_state.date_column_name = ""
+# --- END NEW FUNCTION ---
 
 # Refresh workspace
 def refresh_workspace():
@@ -254,10 +299,20 @@ def refresh_workspace():
             else:
                 st.session_state.tables = tdf["table_name"].astype(str).tolist()
                 st.session_state.selected_table = st.session_state.tables[0] if st.session_state.tables else None
+            
+            # --- ADDED CALL ---
+            # When workspace refreshes, auto-select first DB/table and guess date col
+            if st.session_state.selected_table:
+                on_table_change() 
+            else:
+                st.session_state.date_column_name = ""
+            # --- END ADDED CALL ---
+
     except Exception as e:
         st.error(f"Failed to refresh workspace metadata: {e}")
         st.session_state.databases = []
         st.session_state.tables = []
+        st.session_state.date_column_name = ""
 
 # Sidebar UI
 if st.sidebar.button("Refresh workspace"):
@@ -279,9 +334,19 @@ if st.session_state.databases:
             tdf = cached_list_table_names(ws, db)
             if tdf.empty:
                 st.session_state.tables = []
+                st.session_state.selected_table = None
             else:
                 st.session_state.tables = tdf["table_name"].astype(str).tolist()
                 st.session_state.selected_table = st.session_state.tables[0] if st.session_state.tables else None
+            
+            # --- ADDED CALL ---
+            # When DB changes, auto-select first table and guess date col
+            if st.session_state.selected_table:
+                on_table_change()
+            else:
+                st.session_state.date_column_name = ""
+            # --- END ADDED CALL ---
+
         except Exception as e:
             st.error(f"Failed to list table names for {ws}.{db}: {e}")
             st.session_state.tables = []
@@ -297,7 +362,13 @@ else:
 
 # Table dropdown
 if st.session_state.tables:
-    st.sidebar.selectbox("Table", options=st.session_state.tables, key="selected_table")
+    # --- MODIFIED: Added on_change to the table selectbox ---
+    st.sidebar.selectbox(
+        "Table", 
+        options=st.session_state.tables, 
+        key="selected_table",
+        on_change=on_table_change # <-- When user picks a new table, re-guess date col
+    )
 else:
     st.sidebar.info("Tables will appear here after selecting a Database")
 
@@ -309,184 +380,131 @@ st.markdown(
     f"**Table**: {st.session_state.selected_table or '—'}"
 )
 
-st.subheader("Table sample, schema and report")
+st.subheader("Generate Report")
 
-# --- NEW DATE FILTER INPUTS ---
-st.info("To filter by date, you MUST provide the exact date column name below.")
+# --- MODIFIED: Added text input for date col, pre-filled by session state ---
+st.info("The AI will *try* to guess the main date column. Please verify or enter the correct column name for filtering.")
 c1, c2, c3 = st.columns(3)
 with c1:
-    st.text_input("Date Column for Filtering (optional)", key="date_column_name")
+    st.text_input("Date Column for Filtering", key="date_column_name")
 with c2:
     st.date_input("Start Date", value=None, key="start_date_filter")
 with c3:
     st.date_input("End Date", value=None, key="end_date_filter")
-# --- END NEW DATE FILTER INPUTS ---
+# --- END MODIFICATION ---
 
-limit = st.number_input("Sample size (rows)", min_value=100, max_value=50000, value=5000, step=1000)
 
-st.text_input(
-    "Report Focus (e.g., 'Pacing Report', 'Sales Trends', 'Anomaly Detection')", 
-    key="report_focus"
-)
+if st.button("Generate report", type="primary", use_container_width=True):
+    ws = st.session_state.workspace
+    db = st.session_state.selected_database
+    tbl = st.session_state.selected_table
+    
+    report_focus = HARDCODED_REPORT_FOCUS
 
-col_preview, col_actions = st.columns([2, 1])
+    # --- READ VALUES FROM UI / SESSION STATE ---
+    start_dt = st.session_state.start_date_filter
+    end_dt = st.session_state.end_date_filter
+    date_col = st.session_state.date_column_name # <-- Reads from the text box
+    # --- END READ ---
 
-with col_preview:
-    if st.button("Preview sample"):
-        ws = st.session_state.workspace
-        db = st.session_state.selected_database
-        tbl = st.session_state.selected_table
-        
-        # --- READ DATE FILTERS ---
-        date_col = st.session_state.date_column_name
-        start_dt = st.session_state.start_date_filter
-        end_dt = st.session_state.end_date_filter
-        # --- END READ DATE FILTERS ---
-
-        if not (ws and db and tbl):
-            st.error("Click Refresh workspace then select a Database and Table.")
-        else:
-            try:
-                # --- MODIFIED FUNCTION CALL ---
+    if not (ws and db and tbl):
+        st.error("Click Refresh workspace then select a Database and Table.")
+    elif not (start_dt and end_dt):
+        st.error("Please select both a Start Date and an End Date.")
+    elif not date_col: # <-- Check if date col is empty
+        st.error("Please provide a Date Column for filtering. The AI may not have been able to guess one.")
+    else:
+        try:
+            # --- MODIFIED: Removed Phase 1, simplified spinner ---
+            with st.spinner(f"Generating report... (using '{date_col}' for date filtering)"):
+                
+                # Fetch schema for the report prompt (already cached)
+                describe_df = cached_describe_table(ws, db, tbl)
+                cols_meta = describe_to_column_meta(describe_df)
+                if not cols_meta:
+                    st.error("Could not fetch table schema.")
+                    st.stop()
+                
+                # Sample data using the date_col from the text box
                 df = sample_table_rows(
                     ws, db, tbl, 
-                    limit=limit, 
+                    limit=2000, 
                     date_col=date_col, 
                     start_dt=start_dt, 
                     end_dt=end_dt
                 )
-                # --- END MODIFIED FUNCTION CALL ---
                 
-                st.write(f"Sample of {ws}.{db}.{tbl} (showing up to {limit} rows)")
-                if date_col and (start_dt or end_dt):
-                    st.write(f"Filtered by `{date_col}` between `{start_dt or '...'}` and `{end_dt or '...'}`")
-                
-                st.dataframe(df.head(2000), use_container_width=True)
-                st.session_state.last_report_df = df 
-            except Exception as e:
-                st.error(f"Failed to fetch sample: {e}")
-                st.session_state.last_report_df = pd.DataFrame()
-
-with col_actions:
-    if st.button("Fetch table schema (DESCRIBE)"):
-        ws = st.session_state.workspace
-        db = st.session_state.selected_database
-        tbl = st.session_state.selected_table
-        if not (ws and db and tbl):
-            st.error("Select workspace, database and table first.")
-        else:
-            try:
-                describe_df = cached_describe_table(ws, db, tbl)
-                if describe_df.empty:
-                    st.warning("DESCRIBE returned no rows.")
-                else:
-                    st.write("Table schema (DESCRIBE) — cached")
-                    st.dataframe(describe_df, use_container_width=True)
-                    cols_meta = describe_to_column_meta(describe_df)
-                    schema_payload = {"workspace": ws, "database": db, "table": tbl, "columns": cols_meta}
-                    save_path = save_schema_json(f"{ws}_{db}_{tbl}", schema_payload)
-                    st.success(f"Schema saved to {save_path}")
-            except Exception as e:
-                st.error(f"Failed to DESCRIBE table: {e}")
-
-    if st.button("Generate report"):
-        ws = st.session_state.workspace
-        db = st.session_state.selected_database
-        tbl = st.session_state.selected_table
-        report_focus = st.session_state.report_focus
-
-        # --- READ DATE FILTERS ---
-        date_col = st.session_state.date_column_name
-        start_dt = st.session_state.start_date_filter
-        end_dt = st.session_state.end_date_filter
-        # --- END READ DATE FILTERS ---
-
-        if not (ws and db and tbl):
-            st.error("Select workspace, database and table first.")
-        else:
-            try:
-                with st.spinner("Generating report... (fetching schema, sampling data, calling LLM)"):
-                    # fetch schema (cached)
-                    describe_df = cached_describe_table(ws, db, tbl)
-                    cols_meta = describe_to_column_meta(describe_df)
-
-                    # --- MODIFIED FUNCTION CALL ---
-                    # Note: We use a hardcoded limit of 2000 for the LLM prompt
-                    df = sample_table_rows(
-                        ws, db, tbl, 
-                        limit=2000, 
-                        date_col=date_col, 
-                        start_dt=start_dt, 
-                        end_dt=end_dt
-                    )
-                    # --- END MODIFIED FUNCTION CALL ---
-                    
-                    st.session_state.last_report_df = df
-                    st.session_state.last_report = ""
-
-                    # --- MODIFIED META ---
-                    meta = {
-                        "workspace": ws, 
-                        "database": db, 
-                        "table": tbl, 
-                        "row_sample_count": len(df)
-                    }
-                    if date_col and (start_dt or end_dt):
-                        meta["filter_date_column"] = date_col
-                    if start_dt:
-                        meta["filter_start_date"] = str(start_dt)
-                    if end_dt:
-                        meta["filter_end_date"] = str(end_dt)
-                    # --- END MODIFIED META ---
-
-                    schema_block = json.dumps({"columns": cols_meta}, indent=2)
-                    preview = df.head(20).to_markdown(index=False) if not df.empty else "No rows available"
-                    try:
-                        stats = df.describe(include="all").to_markdown() if not df.empty else "No stats available"
-                    except Exception:
-                        stats = "Stats unavailable"
-                    
-                    prompt = (
-                        f"Workspace context:\n{json.dumps(meta, indent=2)}\n\n"
-                        f"Table schema:\n{schema_block}\n\n"
-                        f"Sample preview (top 20 rows):\n{preview}\n\n"
-                        f"Descriptive stats:\n{stats}\n\n"
-                        f"Task:\nGenerate a concise, meaningful report focused on: **{report_focus or 'General Analysis'}**\n"
-                        "- Base all analysis *only* on the schema and data sample provided.\n"
-                        "- If the data is filtered by date (see context), all insights must be for that specific period.\n"
-                        "- Identify key trends, anomalies, and business-relevant insights related to the focus.\n"
-                        "- Highlight potential data quality issues.\n"
-                        "- Suggest next analyses or metrics.\n"
-                        "- Use clear section headings and bullet points.\n"
-                        "- Avoid reprinting raw data.\n"
-                    )
-
-                    system = "You are a senior data analyst. Provide accurate, concise, action-oriented insights. If data is limited or filtered, state assumptions clearly."
-                    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-                    payload = {"model": MODEL_NAME, "temperature": 0.2, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]}
-                    resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=120)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    report = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    
-                    if report:
-                        st.session_state.last_report = report
-                    else:
-                        st.error("Groq returned an empty report.")
-            except Exception as e:
-                st.error(f"Report generation failed: {e}")
+                st.session_state.last_report_df = df
                 st.session_state.last_report = ""
-                st.session_state.last_report_df = pd.DataFrame()
 
-# --- NEW SECTION: Report and Export Area ---
+                meta = {
+                    "workspace": ws, 
+                    "database": db, 
+                    "table": tbl, 
+                    "row_sample_count": len(df),
+                    "filter_date_column": date_col, # From text box
+                    "filter_start_date": str(start_dt),
+                    "filter_end_date": str(end_dt)
+                }
+
+                schema_block = json.dumps({"columns": cols_meta}, indent=2)
+                preview = df.head(20).to_markdown(index=False) if not df.empty else "No rows available"
+                try:
+                    stats = df.describe(include="all").to_markdown() if not df.empty else "No stats available"
+                except Exception:
+                    stats = "Stats unavailable"
+                
+                # --- This is the enhanced prompt for better insights ---
+                prompt = (
+                    f"Workspace context:\n{json.dumps(meta, indent=2)}\n\n"
+                    f"Table schema:\n{schema_block}\n\n"
+                    f"Sample preview (top 20 rows):\n{preview}\n\n"
+                    f"Descriptive stats:\n{stats}\n\n"
+                    f"Task:\nGenerate a deep, quantitative analysis focused on: **{report_focus}**\n"
+                    "- **Prioritize hard numbers:** Use the provided data to calculate key metrics, totals, averages, and percentage changes.\n"
+                    "- **Identify meaningful insights:** Go beyond simple observations. Explain *why* trends are happening and what their business impact is. Look for correlations or anomalies.\n"
+                    "- **Structure the report:** Start with a high-level **Executive Summary** (with 3-4 key numbers). Then, create sections for **Detailed Analysis & Insights**, **Key Trends**, and **Potential Data Quality Issues**.\n"
+                    "- **Be quantitative:** All insights must be supported by specific numbers, metrics, or statistics from the data.\n"
+                    "- Base all analysis *only* on the schema and data sample provided for the specified date range.\n"
+                    "- Suggest next analyses or metrics that would add more value.\n"
+                    "- Use clear section headings (like 'Executive Summary') and bullet points.\n"
+                    "- Avoid reprinting raw data.\n"
+                )
+
+                # --- This is the enhanced system message ---
+                system = (
+                    "You are a principal data scientist. Your audience is a business executive. "
+                    "They need a deep, quantitative report, not a simple description. "
+                    "Focus on metrics, financial insights, and the 'so what' of the data. "
+    
+                    "All analysis must be for the specified date range."
+                )
+                
+                headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+                payload = {"model": MODEL_NAME, "temperature": 0.1, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]}
+                resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=120)
+                resp.raise_for_status()
+                data = resp.json()
+                report = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                
+                if report:
+                    st.session_state.last_report = report
+                else:
+                    st.error("Groq returned an empty report.")
+        except Exception as e:
+            st.error(f"Report generation failed: {e}")
+            st.session_state.last_report = ""
+            st.session_state.last_report_df = pd.DataFrame()
+
+# --- Report and Export Area ---
 if st.session_state.last_report:
+    st.divider()
     st.subheader("Generated Report")
     st.markdown(st.session_state.last_report)
     
     col1, col2 = st.columns(2)
     
     with col1:
-        # Download button for the LLM's text report
         st.download_button(
             label="📥 Download Report as Text (.txt)",
             data=st.session_state.last_report.encode("utf-8"),
@@ -495,7 +513,6 @@ if st.session_state.last_report:
         )
         
     with col2:
-        # Download button for the data sample as Excel
         if not st.session_state.last_report_df.empty:
             excel_data = to_excel(st.session_state.last_report_df)
             st.download_button(
